@@ -1,0 +1,880 @@
+//--------------------------------------------------------------------------
+// Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License Version 2 as published
+// by the Free Software Foundation.  You may not use, modify or distribute
+// this program under any other version of the GNU General Public License.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+//--------------------------------------------------------------------------
+// binder.cc author Russ Combs <rucombs@cisco.com>
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "detection/detection_engine.h"
+#include "flow/flow.h"
+#include "log/messages.h"
+#include "managers/inspector_manager.h"
+#include "profiler/profiler.h"
+#include "pub_sub/assistant_gadget_event.h"
+#include "stream/stream.h"
+#include "stream/stream_splitter.h"
+#include "target_based/host_attributes.h"
+
+#include "bind_module.h"
+#include "binding.h"
+
+using namespace snort;
+using namespace std;
+
+THREAD_LOCAL ProfileStats bindPerfStats;
+
+//-------------------------------------------------------------------------
+// helpers
+//-------------------------------------------------------------------------
+
+static Inspector* get_gadget(const Flow& flow)
+{
+    if (flow.ssn_state.snort_protocol_id == UNKNOWN_PROTOCOL_ID)
+        return nullptr;
+
+    const SnortConfig* sc = SnortConfig::get_conf();
+    const char* s = sc->proto_ref->get_name(flow.ssn_state.snort_protocol_id);
+
+    return InspectorManager::get_inspector_by_service(s, IT_SERVICE);
+}
+
+static Inspector* get_gadget_by_service(const char* service)
+{
+    const SnortConfig* sc = SnortConfig::get_conf();
+    const SnortProtocolId id = sc->proto_ref->find(service);
+    const char* s = sc->proto_ref->get_name(id);
+
+    return InspectorManager::get_inspector_by_service(s, IT_SERVICE);
+}
+
+static std::string to_string(const sfip_var_t* list)
+{
+    std::string ipset;
+
+    if (!list or !list->head)
+        return "";
+
+    for (auto node = list->head; node; node = node->next)
+    {
+        SfIpString ip_str;
+        auto ip = node->ip;
+
+        ip->get_addr()->ntop(ip_str);
+        ipset += std::string(ip_str);
+
+        if (((ip->get_family() == AF_INET6) and (ip->get_bits() != 128)) or
+            ((ip->get_family() == AF_INET) and (ip->get_bits() != 32)))
+        {
+            auto bits = ip->get_bits();
+            bits -= (ip->get_family() == AF_INET and bits) ? 96 : 0;
+            ipset += "/" + std::to_string(bits);
+        }
+
+        ipset += ", ";
+    }
+
+    if (!ipset.empty())
+        ipset.erase(ipset.end() - 2, ipset.end());
+
+    return ipset;
+}
+
+template <unsigned N>
+static std::string to_string(const std::bitset<N>& bitset)
+{
+    std::stringstream ss;
+
+    if (bitset.none() or bitset.all())
+        return "";
+
+    for (unsigned i = 0; i < bitset.size(); ++i)
+        if (bitset[i])
+            ss << i << " ";
+
+    auto str = ss.str();
+    if (!str.empty())
+        str.pop_back();
+
+    return str;
+}
+
+template <typename T>
+static std::string to_string(const std::unordered_set<T>& set)
+{
+    if (set.empty())
+        return "";
+
+    std::vector<T> elements;
+    elements.insert(elements.end(), set.begin(), set.end());
+    std::sort(elements.begin(), elements.end());
+
+    std::stringstream ss;
+    for (auto e : elements)
+        ss << e << " ";
+
+    auto str = ss.str();
+    if (!str.empty())
+        str.pop_back();
+
+    return str;
+}
+
+static std::string to_string(const BindWhen::Role& role)
+{
+    switch(role)
+    {
+        case BindWhen::BR_CLIENT:
+            return "client";
+        case BindWhen::BR_SERVER:
+            return "server";
+        default:
+            return "";
+    }
+}
+
+static std::string proto_to_string(unsigned proto)
+{
+    switch(proto)
+    {
+        case PROTO_BIT__IP:
+            return "ip";
+        case PROTO_BIT__ICMP:
+            return "icmp";
+        case PROTO_BIT__TCP:
+            return "tcp";
+        case PROTO_BIT__UDP:
+            return "udp";
+        case PROTO_BIT__PDU:
+            return "user";
+        case PROTO_BIT__FILE:
+            return "file";
+        default:
+            return "";
+    }
+}
+
+static std::string to_string(const BindUse::Action& action)
+{
+    switch(action)
+    {
+        case BindUse::BA_RESET:
+            return "reset";
+        case BindUse::BA_BLOCK:
+            return "block";
+        case BindUse::BA_ALLOW:
+            return "allow";
+        default:
+            return "";
+    }
+}
+
+static std::string to_string(const BindWhen& bw)
+{
+    std::string when;
+
+    when += "{";
+
+    auto role = to_string(bw.role);
+    if (!role.empty())
+        when += " role = " + role + ",";
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_IPS_ID))
+        when += " ips_policy_id = " + std::to_string(bw.ips_id_user) + ",";
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_VLANS))
+    {
+        auto vlans = to_string<4096>(bw.vlans);
+        when += " vlans = " + vlans + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_SVC))
+        when += " service = " + bw.svc + ",";
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_SPLIT_NETS))
+    {
+        auto src_nets = to_string(bw.src_nets);
+        auto dst_nets = to_string(bw.dst_nets);
+        if (!src_nets.empty())
+            when += " src_nets = " + src_nets + ",";
+        if (!dst_nets.empty())
+            when += " dst_nets = " + dst_nets + ",";
+    }
+    else if (bw.has_criteria(BindWhen::Criteria::BWC_NETS))
+    {
+        auto nets = to_string(bw.src_nets);
+        when += " nets = " + nets + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_PROTO))
+    {
+        auto proto = proto_to_string(bw.protos);
+        when += " proto = " + proto + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_SPLIT_PORTS))
+    {
+        auto src_ports = to_string<65536>(bw.src_ports);
+        auto dst_ports = to_string<65536>(bw.dst_ports);
+        if (!src_ports.empty())
+            when += " src_ports = " + src_ports + ",";
+        if (!dst_ports.empty())
+            when += " dst_ports = " + dst_ports + ",";
+    }
+    else if (bw.has_criteria(BindWhen::Criteria::BWC_PORTS))
+    {
+        auto ports = to_string<65536>(bw.src_ports);
+        when += " ports = " + ports + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_SPLIT_GROUPS))
+    {
+        auto src_groups = to_string<int16_t>(bw.src_groups);
+        auto dst_groups = to_string<int16_t>(bw.dst_groups);
+        if (!src_groups.empty())
+            when += " src_groups = " + src_groups + ",";
+        if (!dst_groups.empty())
+            when += " dst_groups = " + dst_groups + ",";
+    }
+    else if (bw.has_criteria(BindWhen::Criteria::BWC_GROUPS))
+    {
+        auto groups = to_string<int16_t>(bw.src_groups);
+        when += " groups = " + groups + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_SPLIT_INTFS))
+    {
+        auto src_intfs = to_string<int32_t>(bw.src_intfs);
+        auto dst_intfs = to_string<int32_t>(bw.dst_intfs);
+        if (!src_intfs.empty())
+            when += " src_intfs = " + src_intfs + ",";
+        if (!dst_intfs.empty())
+            when += " dst_intfs = " + dst_intfs + ",";
+    }
+    else if (bw.has_criteria(BindWhen::Criteria::BWC_INTFS))
+    {
+        auto intfs = to_string<int32_t>(bw.src_intfs);
+        when += " intfs = " + intfs + ",";
+    }
+
+    if (bw.has_criteria(BindWhen::Criteria::BWC_ADDR_SPACES))
+    {
+        auto addr_spaces = to_string<uint16_t>(bw.addr_spaces);
+        when += " addr_spaces = " + addr_spaces + ",";
+    }
+
+    if (when.length() > 1)
+        when.pop_back();
+
+    when += " }";
+
+    return when;
+}
+
+static std::string to_string(const BindUse& bu)
+{
+    std::string use;
+
+    use += "{";
+
+    auto action = to_string(bu.action);
+    if (!action.empty())
+        use += " action = " + action + ",";
+
+    if (!bu.svc.empty())
+        use += " service = " + bu.svc + ",";
+
+    if (!bu.type.empty())
+        use += " type = " + ((bu.type.at(0) == '.') ? bu.type.substr(1) : bu.type) + ",";
+
+    if (!bu.name.empty() and (bu.type != bu.name))
+        use += " name = " + bu.name + ",";
+
+    if (use.length() > 1)
+        use.pop_back();
+
+    use += " }";
+
+    return use;
+}
+
+//-------------------------------------------------------------------------
+// stuff stuff
+//-------------------------------------------------------------------------
+
+struct Stuff
+{
+    BindUse::Action action = BindUse::BA_INSPECT;
+
+    Inspector* client = nullptr;
+    Inspector* server = nullptr;
+    Inspector* wizard = nullptr;
+    Inspector* gadget = nullptr;
+    Inspector* data = nullptr;
+
+    bool update(const Binding&);
+
+    void apply_action(Flow&);
+    void apply_session(Flow&, const HostAttributesEntry);
+    void apply_service(Flow&, const HostAttributesEntry);
+    void apply_assistant(Flow&, const char*);
+};
+
+bool Stuff::update(const Binding& pb)
+{
+    if (pb.use.action != BindUse::BA_INSPECT)
+    {
+        action = pb.use.action;
+        return true;
+    }
+
+    switch (pb.use.what)
+    {
+        case BindUse::BW_NONE:
+            break;
+        case BindUse::BW_PASSIVE:
+            data = pb.use.inspector;
+            break;
+        case BindUse::BW_CLIENT:
+            client = pb.use.inspector;
+            break;
+        case BindUse::BW_SERVER:
+            server = pb.use.inspector;
+            break;
+        case BindUse::BW_STREAM:
+            client = server = pb.use.inspector;
+            break;
+        case BindUse::BW_WIZARD:
+            wizard = pb.use.inspector;
+            return true;
+        case BindUse::BW_GADGET:
+            gadget = pb.use.inspector;
+            return true;
+        default:
+            break;
+    }
+    return false;
+}
+
+void Stuff::apply_action(Flow& flow)
+{
+    switch (action)
+    {
+        case BindUse::BA_RESET:
+            flow.set_state(Flow::FlowState::RESET);
+            break;
+        case BindUse::BA_BLOCK:
+            flow.set_state(Flow::FlowState::BLOCK);
+            break;
+        case BindUse::BA_ALLOW:
+            flow.set_state(Flow::FlowState::ALLOW);
+            break;
+        case BindUse::BA_INSPECT:
+            flow.set_state(Flow::FlowState::INSPECT);
+            break;
+        default:
+            break;
+    }
+}
+
+void Stuff::apply_session(Flow& flow, const HostAttributesEntry host)
+{
+    if (client)
+        flow.set_client(client);
+    else if (flow.ssn_client)
+        flow.clear_client();
+
+    if (server)
+        flow.set_server(server);
+    else if (flow.ssn_server)
+        flow.clear_server();
+
+    switch (flow.pkt_type)
+    {
+        case PktType::IP:
+            flow.ssn_policy = host ? host->get_frag_policy() : 0;
+            break;
+        case PktType::TCP:
+            flow.ssn_policy = host ? host->get_stream_policy() : 0;
+            break;
+        default:
+            break;
+    }
+}
+
+void Stuff::apply_service(Flow& flow, const HostAttributesEntry host)
+{
+    if (data)
+        flow.set_data(data);
+
+    if (host)
+        Stream::set_snort_protocol_id(&flow, host, FROM_SERVER);
+
+    if (!gadget)
+        gadget = get_gadget(flow);
+
+    if (gadget)
+    {
+        if (gadget != flow.gadget)
+        {
+            flow.set_gadget(gadget);
+
+            if (flow.ssn_state.snort_protocol_id == UNKNOWN_PROTOCOL_ID)
+                flow.ssn_state.snort_protocol_id = gadget->get_service();
+
+            DataBus::publish(SERVICE_INSPECTOR_CHANGE_EVENT, DetectionEngine::get_current_packet());
+        }
+    }
+    else if (wizard)
+        flow.set_clouseau(wizard);
+}
+
+void Stuff::apply_assistant(Flow& flow, const char* service)
+{
+    if (!gadget)
+        gadget = get_gadget_by_service(service);
+
+    if (gadget)
+        flow.set_assistant_gadget(gadget);
+}
+
+//-------------------------------------------------------------------------
+// class stuff
+//-------------------------------------------------------------------------
+
+class Binder : public Inspector
+{
+public:
+    Binder(vector<Binding>&, vector<Binding>&);
+    ~Binder() override;
+
+    void remove_inspector_binding(SnortConfig*, const char*) override;
+
+    bool configure(SnortConfig*) override;
+    void show(const SnortConfig*) const override;
+
+    void eval(Packet*) override { }
+
+    void handle_flow_setup(Flow&, bool standby = false);
+    void handle_flow_service_change(Flow&);
+    void handle_assistant_gadget(const char* service, Flow&);
+
+private:
+    void get_policy_bindings(Flow&, const char* service);
+    void get_bindings(Flow&, Stuff&, const char* service = nullptr);
+    void apply(Flow&, Stuff&);
+    void apply_assistant(Flow&, Stuff&, const char*);
+    Inspector* find_gadget(Flow&);
+
+private:
+    vector<Binding> bindings;
+    vector<Binding> policy_bindings;
+    Inspector* default_ssn_inspectors[to_utype(PktType::MAX)]{};
+};
+
+class FlowStateSetupHandler : public DataHandler
+{
+public:
+    FlowStateSetupHandler() : DataHandler(BIND_NAME) { }
+
+    void handle(DataEvent&, Flow* flow) override
+    {
+        Binder* binder = InspectorManager::get_binder();
+        if (binder && flow)
+            binder->handle_flow_setup(*flow);
+    }
+};
+
+// When a flow's service changes, re-evaluate service to inspector mapping.
+class FlowServiceChangeHandler : public DataHandler
+{
+public:
+    FlowServiceChangeHandler() : DataHandler(BIND_NAME) { }
+
+    void handle(DataEvent&, Flow* flow) override
+    {
+        Binder* binder = InspectorManager::get_binder();
+        if (binder && flow)
+            binder->handle_flow_service_change(*flow);
+    }
+};
+
+class StreamHANewFlowHandler : public DataHandler
+{
+public:
+    StreamHANewFlowHandler() : DataHandler(BIND_NAME) { }
+
+    void handle(DataEvent&, Flow* flow) override
+    {
+        Binder* binder = InspectorManager::get_binder();
+        if (binder && flow)
+            binder->handle_flow_setup(*flow, true);
+    }
+};
+
+class AssistantGadgetHandler : public DataHandler
+{
+public:
+    AssistantGadgetHandler() : DataHandler(BIND_NAME) { }
+
+    void handle(DataEvent& event, Flow* flow) override
+    {
+        Binder* binder = InspectorManager::get_binder();
+        AssistantGadgetEvent* assistant_event = (AssistantGadgetEvent*)&event;
+
+        if (binder && flow)
+            binder->handle_assistant_gadget(assistant_event->get_service(), *flow);
+    }
+};
+
+Binder::Binder(vector<Binding>& bv, vector<Binding>& pbv)
+{
+    bindings = std::move(bv);
+    policy_bindings = std::move(pbv);
+}
+
+Binder::~Binder()
+{
+    for (Binding& b : bindings)
+        b.clear();
+
+    for (Binding& b : policy_bindings)
+        b.clear();
+}
+
+bool Binder::configure(SnortConfig* sc)
+{
+    for (Binding& b : bindings)
+        b.configure(sc);
+
+    for (Binding& b : policy_bindings)
+        b.configure(sc);
+
+    // Grab default session inspectors if they exist for this policy
+    for (int proto = to_utype(PktType::NONE); proto < to_utype(PktType::MAX); proto++)
+    {
+        const char* name;
+        switch (static_cast<PktType>(proto))
+        {
+            case PktType::IP:   name = "stream_ip"; break;
+            case PktType::TCP:  name = "stream_tcp"; break;
+            case PktType::UDP:  name = "stream_udp"; break;
+            case PktType::ICMP: name = "stream_icmp"; break;
+            case PktType::PDU:  name = "stream_user"; break;
+            case PktType::FILE: name = "stream_file"; break;
+            default:            name = nullptr; break;
+        }
+        if (name)
+            default_ssn_inspectors[proto] = InspectorManager::get_inspector(name);
+    }
+
+    DataBus::subscribe(FLOW_STATE_SETUP_EVENT, new FlowStateSetupHandler());
+    DataBus::subscribe(FLOW_SERVICE_CHANGE_EVENT, new FlowServiceChangeHandler());
+    DataBus::subscribe(STREAM_HA_NEW_FLOW_EVENT, new StreamHANewFlowHandler());
+    DataBus::subscribe(FLOW_ASSISTANT_GADGET_EVENT, new AssistantGadgetHandler());
+
+    return true;
+}
+
+void Binder::show(const SnortConfig*) const
+{
+    std::once_flag b_once;
+
+    for (const Binding& b : bindings)
+    {
+        std::call_once(b_once, []{ ConfigLogger::log_option("bindings"); });
+
+        auto bind_when = "{ when = " + to_string(b.when) + ",";
+        auto bind_use = "use = " + to_string(b.use) + " }";
+        ConfigLogger::log_list("", bind_when.c_str(), "   ");
+        ConfigLogger::log_list("", bind_use.c_str(), "   ", true);
+    }
+
+    std::once_flag pb_once;
+
+    for (const Binding& b : policy_bindings)
+    {
+        std::call_once(pb_once, []{ ConfigLogger::log_option("policy_bindings"); });
+
+        auto bind_when = "{ when = " + to_string(b.when) + ",";
+        auto bind_use = "use = " + to_string(b.use) + " }";
+        ConfigLogger::log_list("", bind_when.c_str(), "   ");
+        ConfigLogger::log_list("", bind_use.c_str(), "   ", true);
+    }
+}
+
+void Binder::remove_inspector_binding(SnortConfig*, const char* name)
+{
+    for (auto it = bindings.begin(); it != bindings.end(); ++it)
+    {
+        const char* key;
+        const Binding &b = *it;
+        if (b.use.svc.empty())
+            key = b.use.name.c_str();
+        else
+            key = b.use.svc.c_str();
+        if (!strcmp(key, name))
+        {
+            bindings.erase(it);
+            return;
+        }
+    }
+}
+
+void Binder::handle_flow_setup(Flow& flow, bool standby)
+{
+    Profile profile(bindPerfStats);
+
+    Stuff stuff;
+    get_bindings(flow, stuff);
+    apply(flow, stuff);
+
+    if (standby)
+        bstats.new_standby_flows++;
+    else
+        bstats.new_flows++;
+    bstats.verdicts[stuff.action]++;
+}
+
+void Binder::handle_flow_service_change(Flow& flow)
+{
+    Profile profile(bindPerfStats);
+
+    Inspector* ins = nullptr;
+    if (flow.service)
+    {
+        ins = find_gadget(flow);
+        if (flow.gadget != ins)
+        {
+            if (flow.gadget)
+                flow.clear_gadget();
+            if (ins)
+            {
+                flow.set_gadget(ins);
+                flow.ssn_state.snort_protocol_id = ins->get_service();
+                DataBus::publish(SERVICE_INSPECTOR_CHANGE_EVENT, DetectionEngine::get_current_packet());
+            }
+            else
+                flow.ssn_state.snort_protocol_id = UNKNOWN_PROTOCOL_ID;
+        }
+    }
+    else
+    {
+        // reset to wizard when service is not specified
+        for (const Binding& b : bindings)
+        {
+            if (b.use.what == BindUse::BW_WIZARD)
+            {
+                ins = b.use.inspector;
+                break;
+            }
+        }
+
+        if (flow.gadget)
+            flow.clear_gadget();
+        if (flow.clouseau)
+            flow.clear_clouseau();
+        if (ins)
+            flow.set_clouseau(ins);
+        flow.ssn_state.snort_protocol_id = UNKNOWN_PROTOCOL_ID;
+    }
+
+    // If there is no inspector bound to this flow after the service change, see if there's at least
+    // an associated protocol ID.
+    if (!ins && flow.service)
+        flow.ssn_state.snort_protocol_id = SnortConfig::get_conf()->proto_ref->find(flow.service);
+
+    if (flow.is_stream())
+    {
+        if (ins)
+        {
+            Stream::set_splitter(&flow, true, ins->get_splitter(true));
+            Stream::set_splitter(&flow, false, ins->get_splitter(false));
+        }
+        else
+        {
+            Stream::set_splitter(&flow, true, new AtomSplitter(true));
+            Stream::set_splitter(&flow, false, new AtomSplitter(false));
+        }
+    }
+
+    bstats.service_changes++;
+}
+
+void Binder::handle_assistant_gadget(const char* service, Flow& flow)
+{
+    Profile profile(bindPerfStats);
+
+    Stuff stuff;
+    get_bindings(flow, stuff, service);
+    apply_assistant(flow, stuff, service);
+
+    bstats.assistant_inspectors++;
+}
+
+void Binder::get_policy_bindings(Flow& flow, const char* service)
+{
+    const SnortConfig* sc = SnortConfig::get_conf();
+    unsigned inspection_index = 0;
+    unsigned ips_index = 0;
+
+    // FIXIT-L This will select the first policy ID of each type that it finds and ignore the rest.
+    //          It gets potentially hairy if people start specifying overlapping policy types in
+    //          overlapping rules.
+    for (const Binding& b : policy_bindings)
+    {
+        // Skip any rules that don't contain an ID for a policy type we haven't set yet.
+        if ((!b.use.inspection_index || inspection_index) && (!b.use.ips_index || ips_index))
+            continue;
+
+        if (!b.check_all(flow, service))
+            continue;
+
+        if (b.use.inspection_index && !inspection_index)
+            inspection_index = b.use.inspection_index;
+
+        if (b.use.ips_index && !ips_index)
+            ips_index = b.use.ips_index;
+    }
+
+    if (inspection_index)
+    {
+        set_inspection_policy(sc, inspection_index);
+        if (!service)
+            flow.inspection_policy_id = inspection_index;
+    }
+
+    if (ips_index)
+    {
+        set_ips_policy(sc, ips_index);
+        if (!service)
+            flow.ips_policy_id = ips_index;
+    }
+}
+
+// FIXIT-P this is a simple linear search until functionality is nailed
+// down.  performance should be the focus of the next iteration.
+void Binder::get_bindings(Flow& flow, Stuff& stuff, const char* service)
+{
+    // Evaluate policy ID bindings first
+    get_policy_bindings(flow, service);
+
+    // If policy selection produced a new binder to use, use that instead.
+    Binder* sub = InspectorManager::get_binder();
+    if (sub && sub != this)
+    {
+        sub->get_bindings(flow, stuff, service);
+        return;
+    }
+
+    // If we got here, that means that a sub-policy with a binder was not invoked.
+    // Continue using this binder for the rest of processing.
+
+    // Initialize the session inspector for both client and server to the default for this policy.
+    stuff.client = stuff.server = default_ssn_inspectors[to_utype(flow.pkt_type)];
+
+    for (const Binding& b : bindings)
+    {
+        if (!b.check_all(flow, service))
+            continue;
+
+        if (stuff.update(b))
+            return;
+    }
+
+    bstats.no_match++;
+}
+
+Inspector* Binder::find_gadget(Flow& flow)
+{
+    Stuff stuff;
+    get_bindings(flow, stuff, flow.service);
+    return stuff.gadget;
+}
+
+void Binder::apply(Flow& flow, Stuff& stuff)
+{
+    stuff.apply_action(flow);
+    if (flow.flow_state != Flow::FlowState::INSPECT)
+        return;
+
+    const HostAttributesEntry host = HostAttributesManager::find_host(flow.server_ip);
+
+    stuff.apply_session(flow, host);
+
+    stuff.apply_service(flow, host);
+}
+
+void Binder::apply_assistant(Flow& flow, Stuff& stuff, const char* service)
+{
+    stuff.apply_assistant(flow, service);
+}
+
+//-------------------------------------------------------------------------
+// api stuff
+//-------------------------------------------------------------------------
+
+static Module* mod_ctor()
+{ return new BinderModule; }
+
+static void mod_dtor(Module* m)
+{ delete m; }
+
+static Inspector* bind_ctor(Module* m)
+{
+    BinderModule* mod = (BinderModule*)m;
+    vector<Binding>& bv = mod->get_bindings();
+    vector<Binding>& pbv = mod->get_policy_bindings();
+    return new Binder(bv, pbv);
+}
+
+static void bind_dtor(Inspector* p)
+{
+    delete p;
+}
+
+static const InspectApi bind_api =
+{
+    {
+        PT_INSPECTOR,
+        sizeof(InspectApi),
+        INSAPI_VERSION,
+        0,
+        API_RESERVED,
+        API_OPTIONS,
+        BIND_NAME,
+        BIND_HELP,
+        mod_ctor,
+        mod_dtor
+    },
+    IT_PASSIVE,
+    PROTO_BIT__ANY_TYPE,
+    nullptr, // buffers
+    nullptr, // service
+    nullptr, // pinit
+    nullptr, // pterm
+    nullptr, // tinit
+    nullptr, // tterm
+    bind_ctor,
+    bind_dtor,
+    nullptr, // ssn
+    nullptr  // reset
+};
+
+const BaseApi* nin_binder = &bind_api.base;
+

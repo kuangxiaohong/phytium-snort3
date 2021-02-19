@@ -1,0 +1,251 @@
+This inspector is still in experimental (work-in-progress) state.
+
+The Real-time Network Awareness (RNA) inspector provides visibility into a network using
+Passive Network Discovery (PND). RNA analyzes traffic to discover hosts on the network
+and to detect operating system (OS) running on a host. It uses fingerprints for OS detection.
+It logs ip/mac addresses, ports, protocols, OS, and other information about traffic running
+on these hosts. It does not generate or alter traffic on its own.
+
+RNA logs information it discovers by parsing TCP/UDP/IP/Link-layer protocols and observing
+data found by other inspectors (e.g., monitoring application IDs, client versions,
+user-agents found by appid or http inspectors). Operating systems have different signatures
+which are apparent in different parameters in the packets that it sends. These parameters
+include things like TCP window sizes, TCP options, segment sizes, etc. Such fingerprinting
+information is provided to RNA as input so that RNA can analyze traffic.
+
+RNA discoveries is stored in host tracker objects, which are saved globally in an LRU cache
+and shared among threads. RNA memory and discovery are bounded by the memcap of cache.
+
+Packets from untracked sessions (e.g., non-IP) are processed via the eval method as per
+proto-bit registrations. Packets from tracked sessions (e.g., IP, TCP, UDP, and ICMP)
+are processed via events as per subscriptions. Since RNA needs to see the first packet
+of a session published from stream trackers, these modules (e.g., stream, stream_icmp,
+stream_ip, stream_tcp, and stream_udp) should be enabled whenever RNA module is enabled.
+
+Currently, RNA only supports host discovery with filtering based on IP/port/interface. To enable
+this (disabled by default), the config file referred by rna_conf_path can have keywords:
+Analyze            # discover application, host, user (only host discovery is implemented)
+AnalyzeHostUser    # discover application, host, user (same as Analyze)
+AnalyzeApplication # discover application
+AnalyzeHost        # discover application, host
+AnalyzeUser        # discover application, user
+portexclusion      # don't discover on this port
+
+Format:
+config keyword [!]ip [interface]
+portexclusion dst|src|both tcp|udp port ip
+
+Examples:
+config AnalyzeHost 0.0.0.0/0 -1     # discover any ipv4 on any interface
+config AnalyzeHost ::/0 2           # discover any ipv6 on interface 2
+config AnalyzeHost !1.2.3.4/16 3    # exclude this ipv4 range on interface 3
+config Analyze !cafe:feed::0/64     # exclude this ipv6 range on any interface
+portexclusion dst udp 53 8.8.8.8    # exclude this ip for UDP port 53 in destination direction
+portexclusion both tcp 4000 ::0/0   # exclude any ipv6 for TCP port 4000 in both direction
+
+Note that exclusion has higher priority than inclusion. RNA does not support application/user
+discovery, fingerprint, fingerprint reader, enable_banner_grab, etc. The enable_logger config
+is to enable/disable sending RNA discovery events to EventManager::call_loggers. Such event logger
+or reader is not implemented yet. However, since RNA stores host information into host_cache,
+to log the discovered hosts into a file, one can
+    1) issue socket command: host_cache.dump('file.out'), or
+    2) add lua config: host_cache = { dump_file = 'file.out'}.
+
+RNA Uses HostCacheMac, derived from LruCacheSharedMemcap, to track MAC addresses. The implementation
+of the MAC cache is as follows:
+
+   HostCacheMac (LruCacheSharedMemcap<uint8_t*, HostTrackerMac, HashMac>)
+      |- - - - Key = uint8_t[6] (mac address)
+      |- - - - Value = HostTrackerMac
+      |                 | - - - - Dynamic memory growth is tracked by HostCacheAllocMac allocator
+      |
+      |- - - - Hash = HashMac
+      |                 |
+                        | - - - - Takes uint8_t[6], returns 64-bit hash of MAC. This allows us to
+                        |             hash a 48 bit value (MAC) to a 64 bit key with relatively
+                                      few collisions. AA:BB:CC:DD:EE:FF becomes 0xAABBCCDDEEFF
+
+In RNAPnd discover_network_ethernet, in some scenarios, we are required to create a host tracker to
+be used for exclusively for logging. The call chain is the following:
+    -> discover_network_ethernet
+        | discover_network_arp
+        | discover_network_bpdu
+            | discover_switch
+
+We pass a host tracker pointer by reference (HostTracker**) from discover_network_ethernet down to
+the lower-level calls. These functions (discover[network_arp|network_bpdu|switch]) are responsible
+for setting the top level pointer to point at their own instantiated host tracker, as it
+needs to be preserved until discover_network_ethernet calls generate_change_vlan_update with this
+newly-created host tracker as an argument. This host tracker is deleted at the top level, and we must
+not return prior to that to avoid leaking any host trackers.
+
+Fingerprints
+
+Fingerprints are a sequence of features in network traffic used to identify a host's operating system.
+
+Tcp fingerprints are specified in lua and read by snort at configure time.
+Only the SYN and SYN-ACK packets are used for fingerprint matching. We refer to the SYN packet
+as "client" and SYN_ACK packet as "server" traffic.
+
+A typical fingerprint looks like this:
+
+-- centos client
+{
+    fpid = 110005,
+    type = 10,
+    uuid = "2fc04d1a-a2c2-11e2-840f-850c4648cdef",
+    ttl = 64,
+    tcp_window = "5712-5760",
+    mss = "X",
+    id = "X",
+    topts = "2 4 8 3",
+    ws = "7",
+    df = false,
+},
+
+This particular example identifies the host as one of 'CentOS Linux version 5.5','CentOS','Linux','Linux 5.5'.
+Note that there is no reference to the actual operating system in the fingerprint, but
+the fpid or the uuid field can be used for this purpose.
+
+The fields are as follows:
+
+fpid: (int) a unique fingerprint identifier. If snort encounters another fingerprint with the same
+      fpid, it will display a warning message and skip it. This field can be used as an index
+      into a database or table with details in human readable form about the host.
+      This field is not used for matching the fingerprint to the network traffic.
+
+type:  (int) the type of traffic this fingerprint should be matched against. Currently, these types
+       are defined in rna_fingerprint.h:
+
+       enum FpType
+       {
+           FINGERPRINT_TYPE_SERVER = 1,
+           FINGERPRINT_TYPE_CLIENT = 2,
+           FINGERPRINT_TYPE_SERVER6 = 10,
+           FINGERPRINT_TYPE_CLIENT6 = 11,
+       };
+
+uuid:  (uuid string, not an arbitrary string) similar in purpose to fpid, e.g. we could store
+       the host details in a file named 2fc04d1a-a2c2-11e2-840f-850c4648cdef.
+       Not used in matching.
+
+ttl:   (int) time to live
+
+df:    (bool) don't fragment flag
+
+The remaining fields are space-separated lists of FpElement, each of FpElementType.
+See rna_fingerprint.h. Such a list might be "1 2-5 6" or simply "X", or "10". Snort
+infers the FpElementType from the input string, e.g. "2-5" will be interpreted as a
+FpElementType::RANGE, and "X" will be interpreted as FpElementType::DONT_CARE.
+See the FpElement::parse_value() function in rna_fingerprint.cc.
+
+Here are all possible element types, with examples for each case:
+
+FpElementType::RANGE:     "1" or "20-30"
+FpElementType::INCREMENT: "+5"
+FpElementType::SYN_MATCH: "SYN"
+FpElementType::RANDOM:    "R"
+FpElementType::DONT_CARE: "X"
+FpElementType::SYNTS:     "TS"
+
+For instance, the list
+
+"1 2-5 SYN"
+
+is a legal list, consisting of 3 elements: 1 (RANGE), 2-5 (RANGE) and SYN (SYN_MATCH).
+While the elements in this list are all valid, there are constraints on the
+type of the elements that make up the fingerprint fields. For instance,
+
+mss = "2 3 X"
+
+would result in error, because DONT_CARE ("X") is not allowed for the mss field.
+
+Here are the remaining fingerprint fields.
+
+tcp_window: the tcp window
+            FpElementType::RANGE
+
+            In the packet, the tcp window is a single integer value, but in the fingerprint
+            we can specify a range like tcp_window = "1234-4321".
+
+            Examples:
+            tcp_window = "1234-4321" -- will match any packet with tcp_window in the range
+            tcp_window = "5678"      -- will match only packets with tcp_window = 5678
+            tcp_window = "R"         -- error: RANDOM is not a valid tcp_window element
+
+mss:   maximum segment size
+       On the client: FpElementType::RANGE, FpFLementType::DONT_CARE
+       On the server: FpElementType::RANGE, FpElementType::DONT_CARE,
+                      FpElementType::SYN_MATCH, FpElementType::SYNTS
+
+       Examples:
+       fptype = 2, mss = "12-34" -- client traffic (fptype = 2) with mss beween 12 and 34
+       fptype = 2, mss = "X"     -- don't use mss for matching, so match anything from cient
+       fptype = 2, mss = "SYN"   -- error: client traffic (fptype = 2) but mss of type SYN_MATCH
+                                    only accepted for server traffic (fptyp1 = 1 or 10)
+       fptype = 1, mss = "TS"    -- OK: server traffic (fptype = 1) and mss of type SYNTS
+       mss = "+5"                -- eror: mss cannot be an INCREMENT type
+
+id:    ip id
+       FpElementType::RANGE
+       FpElementType::RANDOM
+       FpElementType::INCREMENT
+       FpElementType::DONT_CARE
+
+       Example:
+       id = "X"
+
+topts: tcp options
+       FpElementType::RANGE
+
+       These are defined by TcpOptCode in src/protocols/tcp_options.h.
+       The ones we use for fingerprint matcing are
+
+       - MAXSEG (2)
+       - WSCALE (3)
+       - SACKOK (4)
+       - TIMESTAMP (8)
+
+       We match (a) whether or not an option is set, (b) what its value is and (c) the order
+       of the options.
+
+       Example:
+       topts = [2 4 8 3] -- will match tcp packets with mss (2), window scale (4), sack OK (8)
+                            and timestamp (3) set, in this exact order. If we swap any two
+                            numbers in topts, the resulting fingerprint will no longer match.
+
+ws:    window scale
+       FpElementType::RANGE
+       FpElementType::DONT_CARE
+
+Similar to the TCP fingerprints, user-agent based fingerprints loads different types of
+fingerprint patterns from Lua configuration, namely os (operating system), device
+(mobile device information), jail-broken (hacked system), and jail-broken-host
+(host information of the hacked system to confirm matching). During packet processing,
+the rna module depends on the HTTP user agent and host information found by the appid
+module and tries to match all parts of user-agent patterns. A sample configuration
+looks like this:
+{
+    fpid = 1,
+    uuid = "10000000-0000-0000-0000-111111111111",
+    ua_type = "device",
+    user_agent = { { substring = "CPU" }, { substring = "OS 3_0" }, { substring = "My Company" } },
+    device = "My Mobile",
+}
+
+UDP fingerprints are of two types, namely DHCP and SMB. Currently only DHCP fingerprints are
+supported. Similar to TCP and user-agent based fingerprints, fingerprint patterns can be specified
+in the lua configuration. DHCP fingerprint matching is based on option fields present in DHCP
+Request packet and the updated lease information is obtained from the DHCP ACK packet. Appid
+module processes the DHCP request packet, parses the option 55 and option 60 fields and publishes
+the DHCPDataEvent. This triggers RNA fingerprint matching and event generation. While processing
+DHCP ACK packet, appid extracts the leased IP, netmask and lease time and publishes the DHCPInfoEvent.
+RNA generates the CHANGE_FULL_DHCP_INFO event with updated lease information.
+A sample DHCP fingerprint is shown below:
+{
+    fpid = 111,
+    uuid = "12345678-1234-1234-1234-123456789111",
+    type = 4,
+    dhcp55 = "1 121 3 6 15 119 252",
+    dhcp60 = "dhcp 5.1.4",
+}

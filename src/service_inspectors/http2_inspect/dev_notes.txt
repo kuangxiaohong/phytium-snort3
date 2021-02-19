@@ -1,0 +1,68 @@
+The HTTP/2 inspector (H2I) converts HTTP/2 frames into HTTP/1.1 message sections and feeds them
+to the new HTTP inspector (NHI) for further processing.
+
+The Http2StreamSplitter splits HTTP/2 traffic on frame boundaries with two exceptions.  First, any
+Continuation frames following a Headers frame are aggregated and sent through detection as a single
+header block.  Second, long Data frames are split into 16kb chunks for inspection as message bodies
+are in NHI.  The Http2StreamSplitter strips the frame headers from the frame data and stores them in
+separate buffers. In the case of a Headers frame followed by Continuation frames, the Headers frame
+header is stored and the Continuation frame headers are discarded.
+
+HTTP/2 frames are stored in frame objects for processing.
+1. Http2Frame - top level class
+2. Http2HeadersFrame : Http2Frame - common elements of frames containing headers
+3. Htt2HeadersFrameWithStartline : Http2HeadersFrame - common elements of headers with start lines
+4. Http2HeadersFrameHeader : Htt2HeadersFrameWithStartline - regular request/response headers
+5. Http2PushPromiseFrame : Htt2HeadersFrameWithStartline - server push headers
+6. Http2HeadersFrameTrailer : Http2HeadersFrame - headers frame containing trailers
+7. Http2DataFrame : Http2Frame
+8. Http2SettingsFrame : Http2Frame
+
+HTTP/2 headers frames can come at the start of a stream and contain the header block, or at the end
+of a stream and contain trailers. H2I contains headers frame subclasses Http2HeadersFrameHeader and
+Http2HeadersFrameTrailer to support these two types of headers frames. Http2PushPromise frames begin
+server pushed streams and also contain the header block.  Headers frames containing the header block
+will contain pseudo-headers that must be converted into an HTTP/1.1 start line in addition to
+regular HTTP/1.1 headers. The two Http2StartLine subclasses, Http2RequestLine and Http2ResponseLine
+perform this translation and generate the start-line, which is stored in a new buffer inside the
+Http2StartLine object. Trailers may only contain regular headers.
+
+Both headers and trailers must undergo HPACK decoding before being sent to NHI for processing. To
+perform decoding, reassemble() makes a first copy of the encoded headers, which is stored in the
+frame_data buffer. The frame_data buffer is passed to the function decode_headers(), which is the
+main loop driving HPACK decoding. Each decoded header line is progressively written to a second
+decoded_headers buffer that will ultimately be sent to NHI.
+
+The main loop in decode_headers() finds the cut point for a single header line. The line is
+passed to decode_header_line(), which parses the line and calls the appropriate decoding function
+based on the header representation type. If the type is indexed, the full header line is looked up
+in the table and copied to the decoded header buffer. The index may belong to either the static or
+the dynamic table. The static table is 61-elements defined in the HPACK RFC. The dynamic table,
+which starts at index 62, is specific to each direction of each flow. For the second type, literal
+to be indexed, the header name may be indexed or a string literal, while the value is always a
+literal. The resulting header line is then added to the dynamic table. The third representation type
+is literal not to be indexed, which is the same as literal to be indexed, except the header line is
+not added to the dynamic table.
+
+H2I has two levels of failure for flow processing. Fatal errors include failures in frame splitting
+and errors in header decoding that compromise the HPACK dictionary. A fatal error will trigger an
+immediate EVENT_MISFORMATTED_HTTP2 and will cause scan() to return ABORT the next time it is called
+in the same direction.
+
+Stream errors affect HTTP/1 processing within a stream. They include errors in frame sequence
+within a stream, errors that cause the HI stream splitter to abort, and errors that cause HI to be
+unable to process a frame. The individual stream will transition to STREAM_ERROR state and HI
+processing of that stream in that direction will end.
+
+H2I supports the NHI test tool. See ../http_inspect/dev_notes.txt for usage instructions.
+
+Memory requirements: Http2FlowData represents all H2I information in a flow. It does not account 
+for the entries in the hpack dynamic table. The formula below estimates the size of an entry 
+in the dynamic table:
+name.length() + value.length() + RFC_ENTRY_OVERHEAD (32 as defined by the RFC)
+
+Using the formula and some sample pcaps, the average size of the dynamic table is 1645 bytes.
+Dynamically allocated objects related to http_inspect are considered separate and are not 
+included. Temporary objects (frame_data and frame_header) are ignored. The remaining dynamically
+allocated are Http2Infractions (8 bytes * 2) and Http2EventsGen(24 bytes * 2)
+Therefore, the memory required by http2 per flow: sizeof(Http2FlowData) + 1645 + 16 + 48 
